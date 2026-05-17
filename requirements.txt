@@ -1,4 +1,4 @@
-langchain==1.2.0
+langchain
 langchain_community
 langchain_core
 langchain_groq
@@ -7,3 +7,9 @@ langchain-google-genai
 langchain_openai
 ipykernel
 langchain-google-vertexai
+deepagents
+tavily-python
+langchain-ollama
+langchain-anthropic
+langgraph
+anthropic
