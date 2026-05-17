@@ -20,4 +20,5 @@ dependencies = [
     "langgraph>=1.0.5",
     "python-dotenv>=1.2.1",
     "tavily-python>=0.7.19",
+    "tiktoken>=0.12.0",
 ]

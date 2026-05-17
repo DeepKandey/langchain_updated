@@ -11,6 +11,7 @@ from typing import Any, TypedDict, Optional
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import tiktoken
 import requests
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter, Retry
@@ -29,6 +30,86 @@ from langchain_ollama import ChatOllama
 # logging
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------
+# NEW: Token counting helpers
+#
+# tiktoken uses cl100k_base (GPT-4 / Claude-compatible BPE encoding).
+# Gemma uses SentencePiece so counts will be ~10-15% off, but this is
+# still far more accurate than character counting and well within the
+# safety margin you leave in max_context_tokens.
+#
+# The encoder is loaded once at module level (it caches internally) so
+# repeated calls to count_tokens() are essentially free after the first.
+# -----------------------------------------------------------------------
+ 
+_TIKTOKEN_ENCODING = "cl100k_base"
+_enc = tiktoken.get_encoding(_TIKTOKEN_ENCODING)
+
+def count_tokens(text: str) -> int:
+    """Return the approximate token count for *text* using tiktoken BPE."""
+    return len(_enc.encode(text))
+ 
+ 
+def trim_to_token_budget(text: str, token_budget: int) -> str:
+    """
+    Trim *text* so it fits within *token_budget* tokens.
+ 
+    Uses tiktoken encode/decode so the result is always valid UTF-8 text
+    with no mid-codepoint splits (unlike a raw character slice).
+    Returns the original string unchanged when it already fits.
+    """
+    tokens = _enc.encode(text)
+    if len(tokens) <= token_budget:
+        return text
+    return _enc.decode(tokens[:token_budget])
+ 
+ 
+def select_go_files_within_budget(
+    files: dict[str, str],
+    token_budget: int,
+) -> tuple[dict[str, str], list[str]]:
+    """
+    NEW: Greedily select whole Go source files until the token budget is exhausted.
+ 
+    Why whole files instead of a raw slice:
+    - A file truncated mid-function is nearly useless to the LLM.
+    - Knowing "file X was omitted" is actionable; a truncated file is silent data loss.
+ 
+    Files are processed in sorted order (consistent, deterministic).
+    The caller should pre-sort by relevance if priority ordering matters.
+ 
+    Returns
+    -------
+    selected : dict[str, str]
+        Files that fit within the budget (whole, unmodified).
+    dropped  : list[str]
+        Names of files that were excluded because they would exceed the budget.
+    """
+    selected: dict[str, str] = {}
+    dropped: list[str] = []
+    used = 0
+ 
+    for name, content in sorted(files.items()):
+        cost = count_tokens(content)
+        if used + cost <= token_budget:
+            selected[name] = content
+            used += cost
+        else:
+            dropped.append(name)
+            log.warning(
+                "select_go_files_within_budget: dropping '%s' (%d tokens) "
+                "— would exceed budget of %d (used so far: %d)",
+                name, cost, token_budget, used,
+            )
+ 
+    log.info(
+        "select_go_files_within_budget: kept %d files (%d tokens used / %d budget), "
+        "dropped %d files: %s",
+        len(selected), used, token_budget,
+        len(dropped), dropped or "none",
+    )
+    return selected, dropped
 
 # -----------------------------------------------------------------------
 # Prompt templates — all LLM prompt content lives here, not in node fns
@@ -418,9 +499,13 @@ class GitLabConfig:
     max_file_fetch_workers: int = 8
 
     # Prompt size guard (rough char budget; tune for your model/context)
-    max_context_chars: int = 128_000
+    # max_context_chars: int = 128_000
 
-    # max_go_files_chars: int = 60_000
+    # CHANGED: renamed from max_context_chars to max_context_tokens.
+    # Value is now a token count, not a character count.
+    # 120_000 leaves ~8k headroom below a 128k-token context window
+    # for system prompts, chat formatting overhead, and the LLM's own reply.
+    max_context_tokens: int = 120_000
 
     # model
     model_name: str = "gemma4:e4b"
@@ -451,6 +536,10 @@ class ReviewState(TypedDict, total=False):
     diff_text:str
     go_files_text: str
     summarized_diff: Optional[str]
+
+    # CHANGED: dropped_go_files added so downstream nodes and logs can
+    # report exactly which files were excluded due to the token budget.
+    dropped_go_files: list[str]
 
     # LLM outputs
     risk_analysis: Optional[str]
@@ -680,23 +769,42 @@ def format_go_files(files: dict[str,str]) -> str:
         out.append(f"### File: `{name}`\n```go\n{files[name]}\n```")
     return "\n\n".join(out)
 
+
 # --- Context budget ---
 
-def available_go_budget(cfg: GitLabConfig, diff_text: str) -> int:
+# -----------------------------------------------------------------------
+# CHANGED: Token budget helper
+#
+# Previously: available_go_budget(cfg, diff_text) -> int  (char count)
+# Now:        available_go_token_budget(cfg, diff_text) -> int  (token count)
+#
+# The function now calls count_tokens() on the actual diff string so the
+# budget reflects real tokenization rather than a character approximation.
+# The result is a token count consumed by select_go_files_within_budget()
+# and trim_to_token_budget(), not a character index.
+# -----------------------------------------------------------------------
+ 
+def available_go_token_budget(cfg: GitLabConfig, diff_text: str) -> int:
     """
-    Derives the Go file char budget from whatever diff text will actually
-    be sent to the LLM — either the full diff or the summarized diff.
-    Called after summarization if that path ran, so the budget reflects
-    the real remaining space.
+    Return the number of tokens remaining for Go source files after
+    accounting for the diff that will be sent to the LLM.
+ 
+    Called with the actual diff string that will be sent (either the full
+    diff or the summarized diff), so the budget is always accurate.
     """
-    budget = cfg.max_context_chars - len(diff_text)
+    diff_tokens = count_tokens(diff_text)
+    budget = cfg.max_context_tokens - diff_tokens
     if budget <= 0:
         log.warning(
-            "Diff alone (%d chars) exceeds max_context_chars (%d). "
-            "Go files will be empty.",
-            len(diff_text), cfg.max_context_chars,
+            "Diff alone (%d tokens) meets or exceeds max_context_tokens (%d). "
+            "Go files will be excluded entirely.",
+            diff_tokens, cfg.max_context_tokens,
         )
         return 0
+    log.info(
+        "Token budget | diff=%d tokens | remaining for Go files=%d tokens",
+        diff_tokens, budget,
+    )
     return budget
 
 # ---
@@ -732,6 +840,7 @@ def load_config_node(state: ReviewState) -> dict:
         "run_dir": str(run_paths["base"]),
         "summarized_diff": None,
         "fetched_files":{},
+        "dropped_go_files": [],   # NEW: initialised here so it's always present in state
         "exit_reason": None
     }
 
@@ -876,13 +985,25 @@ def assemble_context_node(state: ReviewState) -> dict:
     run_paths["formatted_diff"].write_text(diff_text, encoding="utf-8")
     run_paths["formatted_go"].write_text(go_files_text, encoding="utf-8")
 
+    diff_tokens = count_tokens(diff_text)
+    go_tokens = count_tokens(go_files_text)
+    log.info(
+        "assemble_context: diff=%d tokens | go_files=%d tokens | "
+        "combined=%d tokens | budget=%d tokens",
+        diff_tokens, go_tokens, diff_tokens + go_tokens, cfg.max_context_tokens,
+    )
+
     return {"diff_text": diff_text, "go_files_text": go_files_text}
 
 def context_size_guard_route(state:ReviewState) -> str:
     cfg = state["cfg"]
-    total = len(state.get("diff_text","")) + len(state.get("go_files_text",""))
-    log.info("Context size (chars): %d | limit: %d", total, cfg.max_context_chars)
-    if total > cfg.max_context_chars:
+    # total = len(state.get("diff_text","")) + len(state.get("go_files_text",""))
+    diff_tokens = count_tokens(state.get("diff_text", ""))
+    go_tokens   = count_tokens(state.get("go_files_text", ""))
+    total_tokens = diff_tokens + go_tokens
+
+    log.info("Context size (tokens): %d | limit: %d", total_tokens, cfg.max_context_tokens)
+    if total_tokens > cfg.max_context_tokens:
         return "summarize_diff"
     return "llm_risk_analysis"
 
@@ -908,53 +1029,68 @@ def llm_risk_analysis_node(state: ReviewState) -> dict:
     # Budget is derived from the actual diff being sent —
     # if summarization ran, the summary is shorter so go files get more room;
     # if it didn't, the full diff length is used. Either way the sum never
-    # exceeds max_context_chars.
-    go_budget = available_go_budget(cfg, diff_for_llm)
-    full_go_files = state["go_files_text"]
-    trimmed_go_files = full_go_files[:go_budget]
+    # exceeds max_context_token.
+    # select_go_files_within_budget keeps whole files and logs exactly
+    # which files were dropped — no silent mid-file truncation.
+    go_token_budget = available_go_token_budget(cfg, diff_for_llm)
+    selected_files, dropped = select_go_files_within_budget(
+        state["fetched_files"], go_token_budget
+    )
+    trimmed_go_files = format_go_files(selected_files)
 
     log.info(
-        "Risk analysis input sizes | diff=%d chars | go_files=%d -> %d chars (budget=%d)",
-        len(diff_for_llm),
-        len(full_go_files),
-        len(trimmed_go_files),
-        go_budget
+        "Risk analysis input | diff=%d tokens | go_files=%d tokens "
+        "(%d files kept, %d dropped)",
+        count_tokens(diff_for_llm),
+        count_tokens(trimmed_go_files),
+        len(selected_files),
+        len(dropped),
     )
+
     chain = _build_chain(cfg, cfg.prompts.risk_analysis)
-    
     log.info("Invoking llm_risk_analysis")
     analysis = chain.invoke({
         "go_files_text": trimmed_go_files,
         "diff_text": diff_for_llm,
     })
-    return {"risk_analysis": analysis}
+
+    # CHANGED: persist dropped file list to state so save_outputs_node can
+    # write it to disk and the caller can see what was excluded.
+    return {"risk_analysis": analysis, "dropped_go_files": dropped}
 
 
 def llm_test_generation_node(state: ReviewState) -> dict:
     """LLM pass #3: generate final test scenarios in tabular format."""
-    
     log.info("Entering llm_test_generation_node")
     cfg = state["cfg"]
+
     diff_for_llm = state.get("summarized_diff") or state["diff_text"]
 
-    go_budget = available_go_budget(cfg, diff_for_llm)
-    full_go_files = state["go_files_text"]
-    trimmed_go_files = full_go_files[:go_budget]          # ← same guard as pass 2
+    # CHANGED: re-apply the same whole-file selection used in pass 2.
+    # This ensures passes 2 and 3 see exactly the same Go file context
+    # even if the state dict is re-entered from a checkpoint.
+    go_token_budget = available_go_token_budget(cfg, diff_for_llm)
+    selected_files, dropped = select_go_files_within_budget(
+        state["fetched_files"], go_token_budget
+    )
+    trimmed_go_files = format_go_files(selected_files)
 
     log.info(
-        "Test generation input sizes | diff=%d chars | go_files=%d -> %d chars (budget=%d)",
-        len(diff_for_llm),
-        len(full_go_files),
-        len(trimmed_go_files),
-        go_budget
+        "Test generation input | diff=%d tokens | go_files=%d tokens "
+        "(%d files kept, %d dropped)",
+        count_tokens(diff_for_llm),
+        count_tokens(trimmed_go_files),
+        len(selected_files),
+        len(dropped),
     )
 
     chain = _build_chain(cfg, cfg.prompts.test_generation)
     resp = chain.invoke({
-        "go_files_text": trimmed_go_files,                             # ← was state["go_files_text"]
+        "go_files_text": trimmed_go_files,                            
         "diff_text": diff_for_llm,
         "risk_analysis": state.get("risk_analysis") or "",
     })
+
     return {"test_scenarios": resp}
 
 def save_outputs_node(state: ReviewState) -> dict:
@@ -974,6 +1110,22 @@ def save_outputs_node(state: ReviewState) -> dict:
         log.info("Saved test_scenarios.md -> %s", base)
     else:
         log.warning("test_scenarios is empty — test_scenarios.md not written")
+
+    # NEW: write dropped file list to disk so it's part of the audit trail.
+    # An empty list is still written so the absence of the file never means
+    # "nothing was dropped" — it always means "this node didn't run".
+    dropped = state.get("dropped_go_files") or []
+    dropped_path = base / "dropped_go_files.txt"
+    dropped_path.write_text(
+        "\n".join(dropped) if dropped else "(none)",
+        encoding="utf-8",
+    )
+    if dropped:
+        log.warning(
+            "save_outputs: %d Go file(s) were excluded from LLM context due to "
+            "token budget — see %s",
+            len(dropped), dropped_path,
+        )
     
     log.info("Run artifacts saved to %s", base)
 
@@ -1193,7 +1345,14 @@ if __name__ == "__main__":
         default="gemma4:e4b",
         help="Ollama model name to use (default: gemma4:e4b)"
     )
-         # Outlook flags (all optional — omit to skip email delivery)
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=120_000,
+        help="Maximum token budget for LLM context (default: 120000). "
+              "Set to ~90% of your model's context window"
+    )
+    # Outlook flags (all optional — omit to skip email delivery)
     parser.add_argument("--email-to",    default="",   help="Recipient email address")
     parser.add_argument("--email-subject", default="Diff Review — Risk Analysis & Test Scenarios")
     parser.add_argument("--ms-tenant-env",   default="MS_TENANT_ID")
@@ -1221,6 +1380,7 @@ if __name__ == "__main__":
         commit_id=args.commit_id,
         token_env=args.token_env,
         model_name=args.model,
+        max_context_tokens=args.max_context_tokens,
         outlook=outlook_cfg,
     )
     app = build_graph()
@@ -1236,6 +1396,12 @@ if __name__ == "__main__":
         print(result.get("risk_analysis", ""))
         print("\n===== TEST SCENARIOS =====\n")
         print(result.get("test_scenarios", ""))
+
+        # surface dropped files in console output so they are not invisible
+        dropped = result.get("dropped_go_files") or []
+        if dropped:
+            print("\n======== DROPPED FROM LLM CONTEXT (token budget) =====\n")
+            print("\n".join(f" - {f}" for f in dropped))
     else:
         # Neither branch produced output — graph may have failed silently
         log.error(

@@ -1082,6 +1082,7 @@ dependencies = [
     { name = "langgraph" },
     { name = "python-dotenv" },
     { name = "tavily-python" },
+    { name = "tiktoken" },
 ]
 
 [package.metadata]
@@ -1101,6 +1102,7 @@ requires-dist = [
     { name = "langgraph", specifier = ">=1.0.5" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "tavily-python", specifier = ">=0.7.19" },
+    { name = "tiktoken", specifier = ">=0.12.0" },
 ]
 
 [[package]]
