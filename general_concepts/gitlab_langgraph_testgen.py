@@ -32,7 +32,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------
-# NEW: Token counting helpers
+# Token counting helpers
 #
 # tiktoken uses cl100k_base (GPT-4 / Claude-compatible BPE encoding).
 # Gemma uses SentencePiece so counts will be ~10-15% off, but this is
@@ -64,33 +64,61 @@ def trim_to_token_budget(text: str, token_budget: int) -> str:
         return text
     return _enc.decode(tokens[:token_budget])
  
+# -----------------------------------------------------------------------
+# NEW: Relevance-based file selection
+#
+# Previously: select_go_files_within_budget() used alphabetical order,
+# so for a 20-25 file commit the files that actually changed could be
+# dropped in favour of unrelated context files whose names start earlier.
+#
+# Now: files whose new_path appears in the diff (directly changed) are
+# placed first. Context-only files (fetched as background) come after.
+# Within each group, order is alphabetical for stability.
+# -----------------------------------------------------------------------
  
-def select_go_files_within_budget(
-    files: dict[str, str],
+def _select_files_by_relevance(
+    fetched_files: dict[str, str],
+    diff_entries: list[dict[str, Any]],
     token_budget: int,
 ) -> tuple[dict[str, str], list[str]]:
     """
-    NEW: Greedily select whole Go source files until the token budget is exhausted.
+    Select whole Go files within the token budget, prioritising files that
+    appear in the diff over files fetched only as background context.
  
-    Why whole files instead of a raw slice:
-    - A file truncated mid-function is nearly useless to the LLM.
-    - Knowing "file X was omitted" is actionable; a truncated file is silent data loss.
- 
-    Files are processed in sorted order (consistent, deterministic).
-    The caller should pre-sort by relevance if priority ordering matters.
+    Priority order:
+      1. Files whose new_path appears in the diff (directly changed)
+      2. Everything else, sorted alphabetically (stable, deterministic)
  
     Returns
     -------
     selected : dict[str, str]
-        Files that fit within the budget (whole, unmodified).
+        Files that fit within the budget, whole and unmodified.
     dropped  : list[str]
-        Names of files that were excluded because they would exceed the budget.
+        Names of files excluded because they would exceed the budget.
     """
+    changed_paths = {
+        e.get("new_path") for e in diff_entries if e.get("new_path")
+    }
+ 
+    priority: list[tuple[str, str]] = []
+    context_only: list[tuple[str, str]] = []
+ 
+    for name, content in fetched_files.items():
+        if name in changed_paths:
+            priority.append((name, content))
+        else:
+            context_only.append((name, content))
+ 
+    # Stable sort within each group
+    priority.sort(key=lambda x: x[0])
+    context_only.sort(key=lambda x: x[0])
+    ordered = priority + context_only
+ 
     selected: dict[str, str] = {}
     dropped: list[str] = []
     used = 0
  
-    for name, content in sorted(files.items()):
+    for name, content in ordered:
         cost = count_tokens(content)
         if used + cost <= token_budget:
             selected[name] = content
@@ -98,19 +126,92 @@ def select_go_files_within_budget(
         else:
             dropped.append(name)
             log.warning(
-                "select_go_files_within_budget: dropping '%s' (%d tokens) "
-                "— would exceed budget of %d (used so far: %d)",
+                "_select_files_by_relevance: dropping '%s' (%d tokens) "
+                "— would exceed budget of %d tokens (used so far: %d tokens). "
+                "This file was %s.",
                 name, cost, token_budget, used,
+                "directly changed" if name in changed_paths else "context-only",
             )
  
     log.info(
-        "select_go_files_within_budget: kept %d files (%d tokens used / %d budget), "
-        "dropped %d files: %s",
+        "_select_files_by_relevance: kept %d files (%d tokens / %d budget), "
+        "dropped %d: %s",
         len(selected), used, token_budget,
         len(dropped), dropped or "none",
     )
     return selected, dropped
-
+ 
+ 
+# -----------------------------------------------------------------------
+# NEW: Chunked diff summarization
+#
+# Previously: summarize_diff_node sent the full raw diff in one LLM call.
+# For a large commit (20-25 files, hundreds of changed functions) that
+# single call could exceed the model's context window and fail or be
+# silently truncated by Ollama before producing any output.
+#
+# Now: the diff is split into token-sized chunks (max_context_tokens // 2,
+# leaving the other half for the system prompt, Go file context, and the
+# model's reply). Each chunk is summarized independently and the per-chunk
+# summaries are concatenated. The downstream risk analysis node then
+# receives a compact, behaviour-focused summary regardless of diff size.
+# -----------------------------------------------------------------------
+ 
+def _summarize_in_chunks(cfg: "GitLabConfig", diff_text: str) -> str:
+    """
+    Split diff_text into token-sized chunks and summarize each independently.
+ 
+    Chunk budget is max_context_tokens // 2, which:
+    - Guarantees each LLM call fits within the model's context window.
+    - Leaves the other half for the system prompt, formatting overhead,
+      and the model's own response tokens.
+ 
+    The final result is the per-chunk summaries joined with a blank line,
+    ready to be consumed by llm_risk_analysis_node as if it were a single
+    short diff.
+    """
+    CHUNK_BUDGET = cfg.max_context_tokens // 2
+ 
+    tokens = _enc.encode(diff_text)
+    total_tokens = len(tokens)
+ 
+    if total_tokens <= CHUNK_BUDGET:
+        # Fast path: diff fits in one call, no splitting needed
+        log.info(
+            "_summarize_in_chunks: diff is %d tokens — fits in one call (budget %d)",
+            total_tokens, CHUNK_BUDGET,
+        )
+        chain = _build_chain(cfg, cfg.prompts.summarize_diff)
+        return chain.invoke({"diff_text": diff_text})
+ 
+    chunks = [
+        _enc.decode(tokens[i: i + CHUNK_BUDGET])
+        for i in range(0, total_tokens, CHUNK_BUDGET)
+    ]
+ 
+    log.info(
+        "_summarize_in_chunks: diff is %d tokens — splitting into %d chunk(s) "
+        "of up to %d tokens each",
+        total_tokens, len(chunks), CHUNK_BUDGET,
+    )
+ 
+    chain = _build_chain(cfg, cfg.prompts.summarize_diff)
+    summaries: list[str] = []
+ 
+    for i, chunk in enumerate(chunks, 1):
+        log.info(
+            "_summarize_in_chunks: invoking LLM for chunk %d / %d (%d tokens)",
+            i, len(chunks), count_tokens(chunk),
+        )
+        summaries.append(chain.invoke({"diff_text": chunk}))
+ 
+    combined = "\n\n".join(summaries)
+    log.info(
+        "_summarize_in_chunks: combined summary is %d tokens across %d chunk(s)",
+        count_tokens(combined), len(chunks),
+    )
+    return combined
+ 
 # -----------------------------------------------------------------------
 # Prompt templates — all LLM prompt content lives here, not in node fns
 # -----------------------------------------------------------------------
@@ -485,7 +586,7 @@ class GitLabConfig:
     project_id: int = 1234
     commit_id: str = ""
     api_base: str = ""
-    token_env:str = "TOKEN"
+    token_env:str = "ENV_TOKEN"
 
     # work_dir root (per-run dir is created under this)
     work_root: Path = Path(".work")
@@ -498,13 +599,11 @@ class GitLabConfig:
     # parallelism
     max_file_fetch_workers: int = 8
 
-    # Prompt size guard (rough char budget; tune for your model/context)
-    # max_context_chars: int = 128_000
-
-    # CHANGED: renamed from max_context_chars to max_context_tokens.
-    # Value is now a token count, not a character count.
-    # 120_000 leaves ~8k headroom below a 128k-token context window
-    # for system prompts, chat formatting overhead, and the LLM's own reply.
+    # Token budget for LLM context.
+    # 120_000 leaves ~8k headroom below a 128k-token context window.
+    # The chunked summarizer uses max_context_tokens // 2 per chunk so
+    # each individual LLM call always fits within the model's window,
+    # even for a commit touching 20-25 files.
     max_context_tokens: int = 120_000
 
     # model
@@ -515,7 +614,9 @@ class GitLabConfig:
     # Optional — set to None to skip email delivery
     outlook: Optional[OutlookConfig] = None
 
-# Langgraph State(Serializable)
+# -----------------------------------------------------------------------
+# LangGraph state(Serializable)
+# -----------------------------------------------------------------------
 class ReviewState(TypedDict, total=False):
     cfg: GitLabConfig
 
@@ -537,7 +638,12 @@ class ReviewState(TypedDict, total=False):
     go_files_text: str
     summarized_diff: Optional[str]
 
-    # CHANGED: dropped_go_files added so downstream nodes and logs can
+    # pre-computed file selection (computed once in select_go_files_node,
+    # consumed by both LLM nodes — avoids redundant token counting and ensures
+    # both passes see exactly the same Go file context).
+    selected_go_files: dict[str, str]
+
+    # dropped_go_files added so downstream nodes and logs can
     # report exactly which files were excluded due to the token budget.
     dropped_go_files: list[str]
 
@@ -548,9 +654,9 @@ class ReviewState(TypedDict, total=False):
     # control / exit
     exit_reason: Optional[str]
 
-# ----
+# -----------------------------------------------------------------------
 # Helpers: security + IO + HTTP
-# ----
+# -----------------------------------------------------------------------
 def require_token(env_key:str) -> str:
     token = os.getenv(env_key)
     if not token:
@@ -649,9 +755,9 @@ def save_json(path:Path, payload: object)-> None:
     ensure_parent_dir(path)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-# -----
+# -----------------------------------------------------------------------
 # GitLab API
-# ----
+# -----------------------------------------------------------------------
 
 def repo_base_url(cfg:GitLabConfig) -> str:
     return f"{cfg.api_base}/projects/{cfg.project_id}/repository"
@@ -716,9 +822,9 @@ def fetch_raw_file_from_ref(
    resp = session.get(url, params={"ref":ref}, timeout=http_timeout(cfg))
    return resp.status_code,resp.text
 
-# ---
-# Diff + File helpers
-# ---
+# -----------------------------------------------------------------------
+# Diff + file helpers
+# -----------------------------------------------------------------------
 def is_go_source_path(path:str) -> bool:
     return (
         path.endswith(".go")
@@ -770,13 +876,8 @@ def format_go_files(files: dict[str,str]) -> str:
     return "\n\n".join(out)
 
 
-# --- Context budget ---
-
 # -----------------------------------------------------------------------
-# CHANGED: Token budget helper
-#
-# Previously: available_go_budget(cfg, diff_text) -> int  (char count)
-# Now:        available_go_token_budget(cfg, diff_text) -> int  (token count)
+# Token budget helper
 #
 # The function now calls count_tokens() on the actual diff string so the
 # budget reflects real tokenization rather than a character approximation.
@@ -807,9 +908,10 @@ def available_go_token_budget(cfg: GitLabConfig, diff_text: str) -> int:
     )
     return budget
 
-# ---
+# -----------------------------------------------------------------------
 # Run directory helpers
-# ---
+# -----------------------------------------------------------------------
+
 def run_dir_for(cfg: GitLabConfig) -> Path:
     # Per-commit run folder for idempotency and easier debugging
     return cfg.work_root / cfg.commit_id
@@ -824,9 +926,10 @@ def paths_for_run(cfg: GitLabConfig) -> dict[str,Path]:
         "formatted_go": base / "formatted_golang_files.txt"
     }
 
-# --
-# Langgraph nodes
-# --
+# -----------------------------------------------------------------------
+# LangGraph nodes
+# -----------------------------------------------------------------------
+
 def load_config_node(state: ReviewState) -> dict:
     load_dotenv()
     cfg = state["cfg"]
@@ -840,7 +943,8 @@ def load_config_node(state: ReviewState) -> dict:
         "run_dir": str(run_paths["base"]),
         "summarized_diff": None,
         "fetched_files":{},
-        "dropped_go_files": [],   # NEW: initialised here so it's always present in state
+        "selected_go_files": {},  # populated by select_go_files node
+        "dropped_go_files": [],   # initialised here so it's always present in state
         "exit_reason": None
     }
 
@@ -1002,49 +1106,105 @@ def context_size_guard_route(state:ReviewState) -> str:
     go_tokens   = count_tokens(state.get("go_files_text", ""))
     total_tokens = diff_tokens + go_tokens
 
-    log.info("Context size (tokens): %d | limit: %d", total_tokens, cfg.max_context_tokens)
+    log.info(
+        "context_size_guard: total=%d tokens | limit=%d tokens",
+        total_tokens, cfg.max_context_tokens
+        )
     if total_tokens > cfg.max_context_tokens:
         return "summarize_diff"
-    return "llm_risk_analysis"
+    return "select_go_files"  # Changed: both paths converge at select_go_files
 
 def summarize_diff_node(state: ReviewState) -> dict:
-    """LLM pass #1 (optional): summarize the diff into test-focused bullets."""
+    """
+    LLM pass #1 (optional): summarize the diff into test-focused bullets.
+    Uses _summarize_in_chunks() so any diff size is handled safely:
+    - Diff <= max_context_tokens // 2: single LLM call, no splitting.
+    - Diff > max_context_tokens // 2: split into chunks, each summarized
+      independently, combined summaries returned as one string.
+    """
     log.info("Entering summarize_diff_node")
     cfg = state["cfg"]
-    chain = _build_chain(cfg, cfg.prompts.summarize_diff)
-    summary = chain.invoke({"diff_text": state["diff_text"]})
+    summary = _summarize_in_chunks(cfg, state["diff_text"])
     return {"summarized_diff": summary}
 
+# -----------------------------------------------------------------------
+# NEW: select_go_files_node
+#
+# Previously: both llm_risk_analysis_node and llm_test_generation_node
+# independently ran select_go_files_within_budget() with alphabetical
+# ordering — computing token counts twice and potentially dropping
+# directly-changed files in favour of unrelated context files.
+#
+# Now: file selection is computed exactly once here, after summarization
+# (if it ran), so the budget reflects the actual diff being sent.
+# _select_files_by_relevance() puts diff-touched files first, ensuring
+# that for a 20-25 file commit the most relevant files are never evicted
+# by alphabetically earlier context-only files.
+# -----------------------------------------------------------------------
+ 
+def select_go_files_node(state: ReviewState) -> dict:
+    """
+    Pre-compute which Go files fit in the token budget, prioritising
+    files that appear in the diff over context-only files.
+ 
+    Runs after summarize_diff (if it ran) so the budget reflects the
+    actual diff string being sent — either summarized or original.
+ 
+    Results stored in state so both LLM nodes use identical context
+    without recomputing.
+    """
+    log.info("Entering select_go_files_node")
+    cfg = state["cfg"]
+ 
+    diff_for_llm = state.get("summarized_diff") or state["diff_text"]
+    go_token_budget = available_go_token_budget(cfg, diff_for_llm)
+ 
+    selected, dropped = _select_files_by_relevance(
+        state["fetched_files"],
+        state["filtered_diff"],
+        go_token_budget,
+    )
+ 
+    log.info(
+        "select_go_files: %d files selected (%d directly changed, %d context-only), "
+        "%d dropped",
+        len(selected),
+        sum(
+            1 for name in selected
+            if name in {e.get("new_path") for e in state["filtered_diff"]}
+        ),
+        len(selected) - sum(
+            1 for name in selected
+            if name in {e.get("new_path") for e in state["filtered_diff"]}
+        ),
+        len(dropped),
+    )
+ 
+    return {
+        "selected_go_files": selected,
+        "dropped_go_files": dropped,
+    }
+ 
 
 def llm_risk_analysis_node(state: ReviewState) -> dict:
     """
     LLM pass #2: identify risks, edge cases, and regressions.
     Uses summarized_diff if available (context was too large), else full diff.
+    Reads pre-computed selected_go_files from state.
+    No budget recalculation — selection was done once in select_go_files_node.
     """
     log.info("Entering llm_risk_analysis_node")
     cfg = state["cfg"]
 
     diff_for_llm = state.get("summarized_diff") or state["diff_text"]
-    
-    # Budget is derived from the actual diff being sent —
-    # if summarization ran, the summary is shorter so go files get more room;
-    # if it didn't, the full diff length is used. Either way the sum never
-    # exceeds max_context_token.
-    # select_go_files_within_budget keeps whole files and logs exactly
-    # which files were dropped — no silent mid-file truncation.
-    go_token_budget = available_go_token_budget(cfg, diff_for_llm)
-    selected_files, dropped = select_go_files_within_budget(
-        state["fetched_files"], go_token_budget
-    )
-    trimmed_go_files = format_go_files(selected_files)
+
+    trimmed_go_files = format_go_files(state["selected_go_files"])
 
     log.info(
-        "Risk analysis input | diff=%d tokens | go_files=%d tokens "
-        "(%d files kept, %d dropped)",
+        "Risk analysis input | diff=%d tokens | go_files=%d tokens | files=%d",
         count_tokens(diff_for_llm),
         count_tokens(trimmed_go_files),
-        len(selected_files),
-        len(dropped),
+        len(state["selected_go_files"]),
     )
 
     chain = _build_chain(cfg, cfg.prompts.risk_analysis)
@@ -1054,34 +1214,26 @@ def llm_risk_analysis_node(state: ReviewState) -> dict:
         "diff_text": diff_for_llm,
     })
 
-    # CHANGED: persist dropped file list to state so save_outputs_node can
-    # write it to disk and the caller can see what was excluded.
-    return {"risk_analysis": analysis, "dropped_go_files": dropped}
+    return {"risk_analysis": analysis}
 
 
 def llm_test_generation_node(state: ReviewState) -> dict:
-    """LLM pass #3: generate final test scenarios in tabular format."""
+    """
+    LLM pass #3: generate final test scenarios in tabular format.
+    Reads pre-computed selected_go_files from state — same context as
+    pass #2, no recalculation.
+    """
     log.info("Entering llm_test_generation_node")
     cfg = state["cfg"]
 
     diff_for_llm = state.get("summarized_diff") or state["diff_text"]
-
-    # CHANGED: re-apply the same whole-file selection used in pass 2.
-    # This ensures passes 2 and 3 see exactly the same Go file context
-    # even if the state dict is re-entered from a checkpoint.
-    go_token_budget = available_go_token_budget(cfg, diff_for_llm)
-    selected_files, dropped = select_go_files_within_budget(
-        state["fetched_files"], go_token_budget
-    )
-    trimmed_go_files = format_go_files(selected_files)
+    trimmed_go_files = format_go_files(state["selected_go_files"])
 
     log.info(
-        "Test generation input | diff=%d tokens | go_files=%d tokens "
-        "(%d files kept, %d dropped)",
+        "Test generation input | diff=%d tokens | go_files=%d tokens | files=%d",
         count_tokens(diff_for_llm),
         count_tokens(trimmed_go_files),
-        len(selected_files),
-        len(dropped),
+        len(state["selected_go_files"]),
     )
 
     chain = _build_chain(cfg, cfg.prompts.test_generation)
@@ -1229,6 +1381,7 @@ def build_graph():
         fetch_go_files_node,
         assemble_context_node,
         summarize_diff_node,
+        select_go_files_node, # NEW: sits between summarize/assemble and LLM nodes
         llm_risk_analysis_node,
         llm_test_generation_node,
         save_outputs_node,
@@ -1254,6 +1407,7 @@ def build_graph():
     FETCH_GO_FILES        = _node_name(fetch_go_files_node)
     ASSEMBLE_CONTEXT      = _node_name(assemble_context_node)
     SUMMARIZE_DIFF        = _node_name(summarize_diff_node)
+    SELECT_GO_FILES        = _node_name(select_go_files_node)
     LLM_RISK_ANALYSIS     = _node_name(llm_risk_analysis_node)
     LLM_TEST_GENERATION   = _node_name(llm_test_generation_node)
     SAVE_OUTPUTS          = _node_name(save_outputs_node)
@@ -1285,22 +1439,31 @@ def build_graph():
 
     g.add_edge(FETCH_GO_FILES, ASSEMBLE_CONTEXT)
 
-    # ------------------------------------------------------------------
-    # Conditional branch: context too large -> summarize first
-    # ------------------------------------------------------------------
+    # Branch: context too large -> summarize first
+    #
+    # CHANGED: both branches now converge at SELECT_GO_FILES, not LLM_RISK_ANALYSIS.
+    #
+    # Small commit flow:  ASSEMBLE_CONTEXT -> SELECT_GO_FILES -> LLM_RISK_ANALYSIS
+    # Large commit flow:  ASSEMBLE_CONTEXT -> SUMMARIZE_DIFF -> SELECT_GO_FILES -> LLM_RISK_ANALYSIS
+    #
+    # This guarantees file selection always sees the final diff string
+    # (original or summarized) so the token budget is always accurate.
     g.add_conditional_edges(
         ASSEMBLE_CONTEXT,
         context_size_guard_route,
         {
-            "summarize_diff":    SUMMARIZE_DIFF,
-            "llm_risk_analysis": LLM_RISK_ANALYSIS,
+            "summarize_diff":  SUMMARIZE_DIFF,
+            "select_go_files": SELECT_GO_FILES,   # CHANGED: was "llm_risk_analysis"
         },
     )
+ 
+    # Summarize path rejoins at SELECT_GO_FILES
+    g.add_edge(SUMMARIZE_DIFF,      SELECT_GO_FILES)   # CHANGED: was LLM_RISK_ANALYSIS
 
     # ------------------------------------------------------------------
     # LLM pipeline — three sequential passes
     # ------------------------------------------------------------------
-    g.add_edge(SUMMARIZE_DIFF,      LLM_RISK_ANALYSIS)   # optional pass feeds into pass 2
+    g.add_edge(SELECT_GO_FILES,      LLM_RISK_ANALYSIS)   # optional pass feeds into pass 2
     g.add_edge(LLM_RISK_ANALYSIS,   LLM_TEST_GENERATION)
     g.add_edge(LLM_TEST_GENERATION,   SAVE_OUTPUTS)
     g.add_edge(SAVE_OUTPUTS, SEND_EMAIL)
